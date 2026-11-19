@@ -1,8 +1,14 @@
-# 遥测网关 UDP 最大负载探测
+# 遥测网关：UDP 最大负载探测 + 高频样本合包
 
-小包能到回显端、大包却超时？本服务为值班员确认遥测网关**可用的最大 UDP 负载**：
-FastAPI + asyncio 实现的探测 API 与本地回显端，默认探测范围 **576～1400 字节**，
-二分搜索收敛，当次返回最大确认长度、各次探测结果及无法判定原因。
+本服务包含两部分能力：
+
+1. **UDP 最大负载探测**：小包能到回显端、大包却超时？为值班员确认遥测网关
+   **可用的最大 UDP 负载**，默认探测范围 **576～1400 字节**，二分搜索收敛；
+2. **遥测合包网关**：高频短样本不再一条一个 UDP 包，发送端**按设备各自合包**，
+   按受理顺序装入完整样本，包满/放不下/等待 2 秒即发，负载上限可在 256～1400
+   字节间动态调整。
+
+FastAPI + asyncio 实现，所有操作都能在 `/docs` 交互完成。
 
 ## 快速开始
 
@@ -28,7 +34,61 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-## 值班流程（/docs 内即可操作）
+## 遥测合包（/docs 内即可操作）
+
+### 模拟设备上报：`POST /telemetry/samples`
+
+```json
+{"device_id": "dev-1", "sample_hex": "0102ab"}
+```
+
+- 交替使用两个设备号（如 `dev-1` / `dev-2`）即可模拟两台设备，设备各自独立合包；
+- `sample_hex` 为偶数位十六进制样本原文，按受理顺序完整装入；
+- **单条样本（含封装开销）超过当前负载上限 → 直接 422 拒收**，不进入待发队列。
+
+### 发包时机（每台设备独立判断）
+
+1. **包满**：再装下一条就会超过负载上限 → 当前包立即发出，下一条进新包；
+2. **等待超时**：包内**最早的样本**已等待 2 秒（后到样本不重置起点）→ 后台任务发包。
+
+### 调整 UDP 负载上限：`PUT /telemetry/config`
+
+```json
+{"payload_limit": 512}
+```
+
+- 合法范围 **256～1400 字节**，且**计入封装开销**（合包头与每条样本的长度前缀）；
+- 调低成功后，待发样本**按新上限重新分包**，原受理顺序与等待起点保持不变，
+  重新分包后装满的包立即发出；
+- 若**任一待发样本单独成包也超过新上限** → 返回 **409 拒绝调整**，
+  继续按旧上限发送，队列原样保留。
+
+### 查看真实接收结果：`GET /telemetry/received`
+
+本地接收器从**实际 UDP 数据报**解码，返回最近 200 条接收记录：
+
+| 字段 | 含义 |
+|---|---|
+| `device_id` | 数据报携带的设备号 |
+| `packet_bytes` | 本 UDP 数据报的实际负载字节数 |
+| `samples_hex` | 包内样本原文（按包内顺序） |
+| `received_at` | 接收时刻（UTC） |
+
+`GET /telemetry/config` 同时返回发送端统计：累计受理/拒收/发包数、各设备待发条数、
+最老待发样本年龄等。
+
+### 合包数据报线格式（大端）
+
+```
+| magic  | dev_len | device_id  | 每条样本：sample_len(2B) + sample |
+| "TEL1" | uint8   | UTF-8 字节 | uint16 大端长度 + 样本原始字节     |
+```
+
+任何字段不自洽的数据报在接收端计入 `malformed_datagrams_total`，不会入库。
+
+## 探测能力（原有 API，照常可用）
+
+### 值班流程
 
 1. **设置回显端行为**：`PUT /echo/config`
    - `{"mode": "normal", "drop_threshold": 1000}` — UDP 负载超过 1000 字节即丢弃；
@@ -51,7 +111,7 @@ pytest tests/ -v
    `attempts[]` 列出每次探测（`probe`）与小包复核（`link-verify`）的尺寸、结果与 RTT。
 4. 历史结论：`GET /probes`、`GET /probe/{probe_id}`（内存保留最近 200 条）。
 
-## 判定规则与需求对应
+### 判定规则与需求对应
 
 - **禁止 IP 分片**：探测与回显 socket 均设置 `IP_MTU_DISCOVER/IP_PMTUDISC_DO`（DF=1），
   结果中 `df_enabled` 如实上报；超过路径 MTU 时发送直接失败（EMSGSIZE），按发送失败处理。
@@ -72,16 +132,21 @@ pytest tests/ -v
 | `ECHO_HOST` | `0.0.0.0` | 回显端监听地址 |
 | `ECHO_PORT` | `9999` | 回显端 UDP 端口 |
 | `PROBE_TARGET_HOST` | `127.0.0.1` | 探测默认目标（`POST /probe` 可用 `target_host/target_port` 覆盖，指向真实网关） |
+| `TELEMETRY_HOST` | `0.0.0.0` | 遥测接收器监听地址 |
+| `TELEMETRY_PORT` | `9998` | 遥测接收器 UDP 端口 |
+| `TELEMETRY_TARGET_HOST` | `127.0.0.1` | 合包发送目标（容器内默认指向本地接收器） |
 
 ## 项目结构
 
 ```
 app/
-  main.py        # FastAPI 路由与生命周期
+  main.py        # FastAPI 路由与生命周期（探测 + 遥测）
   echo_server.py # 本地回显端（阈值丢弃/断联，epoch）
   prober.py      # 二分探测引擎（DF、探测编号、小包复核、作废判定）
   packets.py     # 探测报文编解码
+  telemetry.py   # 合包发送器（按设备队列/2 秒刷新/动态上限）、本地接收器与线格式
   netutil.py     # DF 位设置
-tests/test_api.py
+tests/test_api.py        # 探测与回显端测试
+tests/test_telemetry.py  # 合包、上限调整、接收器测试
 Dockerfile / docker-compose.yml
 ```
